@@ -83,13 +83,20 @@
                 </p>
                 <!-- Add a select element for currency filtering -->
                 <p>
-                Current currency:
+                Währung auswählen 
                 </p>
                 <select id="currency-filter">
                     <option value="Euro">Euro</option>
                     <option value="Crown">Crown</option>
                     <option value="Franc">Franc</option>
                     <!-- Add more currency options if needed -->
+                </select>
+                <p>
+                Wiegebon aktivieren 
+                </p>
+                <select id="wiegebon-filter">
+                    <option value="Ja">Ja</option>
+                    <option value="Nein">Nein</option>
                 </select>
             </div>
         </div>
@@ -175,6 +182,7 @@
             const path = require('path');
 
             const currencyFilter = document.getElementById('currency-filter');
+            const wiegebonFilter = document.getElementById('wiegebon-filter');
 
             // Function to set the selected option in the currency filter
             const setSelectedOption = (currencyConfig) => {
@@ -182,6 +190,40 @@
                     currencyFilter.value = currencyConfig.currency_type;
                 }
             };
+
+            const setWiegebonSelectedOption = (wiegebonConfig) => {
+                if(wiegebonConfig && wiegebonConfig.druk_type){
+                    wiegebonFilter.value = wiegebonConfig.druk_type;
+                }
+            };
+
+            wiegebonFilter.addEventListener('change', async (event) => {
+                const selectedDrukType = event.target.value;
+                try {
+                    // Get the directory path of the executable file
+                    const appDirectory = path.dirname(process.execPath);
+
+                    // Construct the path to the wiegebon configuration JSON file
+                    const wiegebonConfigPath = path.join(appDirectory, 'wiegebon_config.json');
+
+                    // Read the wiegebon configuration JSON file
+                    const wiegebonConfigData = await fs.readFile(wiegebonConfigPath, 'utf8');
+                    let wiegebonConfig = JSON.parse(wiegebonConfigData);
+
+                    // Update the wiegebon type in the JSON object
+                    wiegebonConfig.currency_type = selectedCurrency;
+
+                    // Convert the updated JSON object back to string
+                    const updatedWiegebonConfigData = JSON.stringify(wiegebonConfig, null, 2);
+
+                    // Write the updated JSON data back to the file
+                    await fs.writeFile(wiegebonConfigPath, updatedWiegebonConfigData, 'utf8');
+                    // Log success message
+                    console.log('Wiegebon updated successfully:', selectedDrukType);
+                } catch (error) {
+                    console.error('Error updating currency:', error);
+                }
+            });
 
             currencyFilter.addEventListener('change', async (event) => {
                 const selectedCurrency = event.target.value;

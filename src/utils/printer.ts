@@ -14,6 +14,20 @@ import ejs from 'ejs';
  */
 export const printReceipt = async (weight: WeightSuccessResponse) => {
 
+    const path = require('path');
+    // render template
+    
+    // Get the directory path of the executable file
+    const appDirectory = path.dirname(process.execPath);
+
+    const wiegebonConfigPath = path.join(appDirectory, 'wiegebon_config.json');
+    const wiegebonConfigData = await fs.readFile(wiegebonConfigPath, 'utf8');
+    const wiegebonConfig = JSON.parse(wiegebonConfigData);
+
+    if(wiegebonConfig.druk_type === "Nein")
+        return;
+
+
     const {
         description_text,
         should_print_additional_text,
@@ -23,11 +37,6 @@ export const printReceipt = async (weight: WeightSuccessResponse) => {
     const [checksumOk, crc] = await verifyCRC();
     const date = new Date();
 
-    const path = require('path');
-    // render template
-    
-        // Get the directory path of the executable file
-        const appDirectory = path.dirname(process.execPath);
 
         // Construct the path to the currency configuration JSON file
         const currencyConfigPath = path.join(appDirectory, 'currency_config.json');

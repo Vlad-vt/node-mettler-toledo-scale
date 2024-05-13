@@ -27,7 +27,10 @@ export class ScaleTranslator {
       k[0] = k[0].padStart(length - precision, '0');
       return k.join('');
     } else {
-      return k[0].padEnd(precision + 1, '0');
+      k[1] = '00';
+      k[0] = k[0].padStart(length - precision, '0');
+      return k.join('');
+      //return k[0].padEnd(precision + 1, '0');
     }
   }
 }
