@@ -7,4 +7,5 @@ export {
   WithReceiptInfo,
 } from './WeightSuccessResponse.type';
 export { Settings, ValidatedSettings } from './Settings.type';
-export { ReceiptContext } from './ReceiptContext.type'
+export { ReceiptContext } from './ReceiptContext.type';
+export { FreshAIRecognitionItem, FreshAIRecognitionResponse, FreshAIBaseResponse } from './FreshAI.type';

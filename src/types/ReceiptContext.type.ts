@@ -6,4 +6,6 @@ export type ReceiptContext = WeightSuccessResponse &
     barcode?: string;
     date?: string;
     crc?:string;
+    tare?: number;
+    ean?: string;
   };

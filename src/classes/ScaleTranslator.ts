@@ -9,9 +9,16 @@ export class ScaleTranslator {
    * @param precision decimal numbers count
    */
   static translateStringToFloat(num: string, precision: number): number {
-    const sub1 = num.slice(0, num.length - precision);
+    // Guard against empty/short input or a non-positive precision, which would
+    // otherwise produce Number(".") === NaN and propagate a NaN weight/price.
+    if (!num || precision <= 0) {
+      const n = Number(num);
+      return Number.isFinite(n) ? n : 0;
+    }
+    const sub1 = num.slice(0, num.length - precision) || '0';
     const sub2 = num.slice(num.length - precision);
-    return Number(sub1 + '.' + sub2);
+    const result = Number(sub1 + '.' + sub2);
+    return Number.isFinite(result) ? result : 0;
   }
 
   /**
@@ -27,10 +34,12 @@ export class ScaleTranslator {
       k[0] = k[0].padStart(length - precision, '0');
       return k.join('');
     } else {
-      k[1] = '00';
+      // BUG FIX: previously this hardcoded '00' which produced wrong-length output
+      // when precision != 2 (e.g. tare with precision=3 returned 3 chars instead of 4).
+      // Now uses actual precision so output is always exactly `length` chars.
+      k[1] = '0'.repeat(precision);
       k[0] = k[0].padStart(length - precision, '0');
       return k.join('');
-      //return k[0].padEnd(precision + 1, '0');
     }
   }
 }

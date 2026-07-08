@@ -88,16 +88,47 @@
                 <select id="currency-filter">
                     <option value="Euro">Euro</option>
                     <option value="Crown">Crown</option>
-                    <option value="Franc">Franc</option>
+                    <option value="BulgrarianLev">Bulgarian Lev</option>
+                    <option value="PolishZloty">Polish Zloty</option>
+                    <option value="SerbianDinar">Serbian Dinar</option>
+                    <option value="SwissFranc">Swiss Franc</option>
                     <!-- Add more currency options if needed -->
                 </select>
                 <p>
-                Wiegebon aktivieren 
+                Wiegebon aktivieren
                 </p>
                 <select id="wiegebon-filter">
                     <option value="Ja">Ja</option>
                     <option value="Nein">Nein</option>
                 </select>
+                <p style="margin-top: 16px;">
+                    <a href="javascript:void(0)" id="advanced-toggle"
+                       style="text-decoration: none; color: #007bff; user-select: none;">
+                        <span id="advanced-toggle-icon">▶</span> Erweiterte Einstellungen
+                    </a>
+                </p>
+                <div id="advanced-panel" style="display: none; padding: 8px; border-left: 2px solid #dee2e6; margin-top: 4px;">
+                    <p>
+                    FreshAI Erkennung
+                    </p>
+                    <select id="freshai-filter">
+                        <option value="Nein">Nein</option>
+                        <option value="Ja">Ja</option>
+                    </select>
+                    <p style="margin-top: 8px;">Delay nach scanner-off (ms)</p>
+                    <input id="delay-after-off" type="number" min="0" step="1" value="0" style="width: 100px;" />
+                    <p style="margin-top: 8px;">Delay vor scanner-on (ms)</p>
+                    <input id="delay-before-on" type="number" min="0" step="1" value="0" style="width: 100px;" />
+                    <p style="margin-top: 12px;">
+                    POS API URL
+                    </p>
+                    <select id="api-url-filter">
+                        <option value="Test">Test (kassesvn.tn-rechenzentrum1.de)</option>
+                        <option value="Release">Release (tn-kasse.de)</option>
+                    </select>
+                    <p style="margin-top: 12px;">reset тары</p>
+                    <button id="reset-tare-btn" style="background:#6f42c1; color:#fff; border:none; padding:6px 12px; cursor:pointer; border-radius:4px;">reset тары</button>
+                </div>
             </div>
         </div>
 
@@ -138,6 +169,21 @@
                 }
             }
             ipcRenderer.on('log', logEvent);
+
+            // handle trigger_stable events
+            ipcRenderer.on('trigger-stable', (event, data) => {
+                const weight = data.weight || '?';
+                const hasRecognition = data.recognition && data.recognition.value && data.recognition.value.length > 0;
+                let msg = `TRIGGER STABLE (Record 52): weight=${weight}kg`;
+                if (hasRecognition) {
+                    const top = data.recognition.value[0];
+                    msg += ` | FreshAI: PLU=${top.plu} (${(top.confidence * 100).toFixed(0)}%)`;
+                    if (data.recognition.value.length > 1) {
+                        msg += ` +${data.recognition.value.length - 1} more`;
+                    }
+                }
+                logEvent(null, msg);
+            });
 
             // handle connection status change
             const connectionBadge = document.getElementById(
@@ -183,6 +229,10 @@
 
             const currencyFilter = document.getElementById('currency-filter');
             const wiegebonFilter = document.getElementById('wiegebon-filter');
+            const freshaiFilter = document.getElementById('freshai-filter');
+            const delayAfterOffInput = document.getElementById('delay-after-off');
+            const delayBeforeOnInput = document.getElementById('delay-before-on');
+            const apiUrlFilter = document.getElementById('api-url-filter');
 
             // Function to set the selected option in the currency filter
             const setSelectedOption = (currencyConfig) => {
@@ -196,6 +246,138 @@
                     wiegebonFilter.value = wiegebonConfig.druk_type;
                 }
             };
+
+            const setFreshaiSelectedOption = (freshaiConfig) => {
+                if (freshaiConfig && freshaiConfig.freshai_enabled !== undefined) {
+                    freshaiFilter.value = freshaiConfig.freshai_enabled ? 'Ja' : 'Nein';
+                }
+            };
+
+            const setApiUrlSelectedOption = (apiConfig) => {
+                if (apiConfig && apiConfig.api_url_type) {
+                    apiUrlFilter.value = apiConfig.api_url_type;
+                }
+            };
+
+            apiUrlFilter.addEventListener('change', async (event) => {
+                const apiUrlType = event.target.value;
+                try {
+                    const appDirectory = path.dirname(process.execPath);
+                    const apiConfigPath = path.join(appDirectory, 'api_config.json');
+                    let apiConfig = {};
+                    try {
+                        const data = await fs.readFile(apiConfigPath, 'utf8');
+                        apiConfig = JSON.parse(data);
+                    } catch (e) {}
+                    apiConfig.api_url_type = apiUrlType;
+                    await fs.writeFile(apiConfigPath, JSON.stringify(apiConfig, null, 2), 'utf8');
+                    logEvent(null, '[CONFIG] API URL saved: ' + apiUrlType + ' → ' + apiConfigPath);
+                } catch (error) {
+                    logEvent(null, '[CONFIG ERROR] API URL save failed: ' + (error && error.message || error));
+                    console.error('Error updating API URL config:', error);
+                }
+            });
+
+            // --- vcodisp.xml trigger_stable controls ---
+            const TRIGGER_STABLE_LINE = '    <trigger_stable state="on" minWeight="100" minWeightChangeGram="100" minWeightChangePercent="0" />';
+
+            async function findVcodispXmlPath() {
+                const appDirectory = path.dirname(process.execPath);
+                const candidates = [
+                    'C:\\Program Files (x86)\\Mettler Toledo\\MTOpos\\VCODisp\\etc\\vcodisp.xml',
+                    'C:\\Program Files\\Mettler Toledo\\MTOpos\\VCODisp\\etc\\vcodisp.xml',
+                    path.join(appDirectory, 'VCODisp', 'etc', 'vcodisp.xml'),
+                    path.join(appDirectory, '..', 'VCODisp', 'etc', 'vcodisp.xml'),
+                ];
+                for (const p of candidates) {
+                    try { await fs.access(p); return p; } catch (e) {}
+                }
+                return null;
+            }
+
+            async function setVcodispTriggerStable(enabled) {
+                const xmlPath = await findVcodispXmlPath();
+                if (!xmlPath) {
+                    logEvent(null, '[CONFIG ERROR] vcodisp.xml not found — cannot toggle trigger_stable in VCODisp');
+                    return false;
+                }
+                try {
+                    let content = await fs.readFile(xmlPath, 'utf8');
+                    const before = content;
+                    if (enabled) {
+                        if (!content.includes('trigger_stable')) {
+                            content = content.replace('</MT_VCODisp>', TRIGGER_STABLE_LINE + '\n</MT_VCODisp>');
+                        } else {
+                            content = content.replace(/(<trigger_stable[^>]*state=")off(")/g, '$1on$2');
+                        }
+                    } else {
+                        if (content.includes('trigger_stable')) {
+                            content = content.replace(/(<trigger_stable[^>]*state=")on(")/g, '$1off$2');
+                        }
+                    }
+                    if (content !== before) {
+                        await fs.writeFile(xmlPath, content, 'utf8');
+                        logEvent(null, '[VCODISP XML] trigger_stable state set to ' + (enabled ? 'on' : 'off') + ' in ' + xmlPath);
+                    } else {
+                        logEvent(null, '[VCODISP XML] trigger_stable already ' + (enabled ? 'on' : 'off') + ' — no change');
+                    }
+                    return true;
+                } catch (e) {
+                    logEvent(null, '[VCODISP XML ERROR] ' + (e && e.message || e));
+                    return false;
+                }
+            }
+
+            freshaiFilter.addEventListener('change', async (event) => {
+                const enabled = event.target.value === 'Ja';
+                try {
+                    const appDirectory = path.dirname(process.execPath);
+                    const freshaiConfigPath = path.join(appDirectory, 'freshai_config.json');
+                    let freshaiConfig = {};
+                    try {
+                        const data = await fs.readFile(freshaiConfigPath, 'utf8');
+                        freshaiConfig = JSON.parse(data);
+                    } catch (e) {}
+                    freshaiConfig.freshai_enabled = enabled;
+                    await fs.writeFile(freshaiConfigPath, JSON.stringify(freshaiConfig, null, 2), 'utf8');
+                    // FreshAI toggle controls: our listener + VCODisp xml trigger_stable
+                    ipcRenderer.send('trigger-stable-toggle', { enabled });
+                    await setVcodispTriggerStable(enabled);
+                    logEvent(null, '[CONFIG] FreshAI + Trigger Stable: ' + (enabled ? 'ON' : 'OFF') + ' → ' + freshaiConfigPath);
+                } catch (error) {
+                    logEvent(null, '[CONFIG ERROR] FreshAI save failed: ' + (error && error.message || error));
+                    console.error('Error updating FreshAI config:', error);
+                }
+            });
+
+            // Save delay fields (after scanner-off / before scanner-on)
+            async function saveDelayField(key, value) {
+                try {
+                    const appDirectory = path.dirname(process.execPath);
+                    const freshaiConfigPath = path.join(appDirectory, 'freshai_config.json');
+                    let cfg = {};
+                    try {
+                        const data = await fs.readFile(freshaiConfigPath, 'utf8');
+                        cfg = JSON.parse(data);
+                    } catch (e) {}
+                    cfg[key] = value;
+                    await fs.writeFile(freshaiConfigPath, JSON.stringify(cfg, null, 2), 'utf8');
+                    logEvent(null, '[CONFIG] ' + key + ' saved: ' + value + 'ms');
+                } catch (error) {
+                    logEvent(null, '[CONFIG ERROR] ' + key + ' save failed: ' + (error && error.message || error));
+                }
+            }
+
+            delayAfterOffInput.addEventListener('change', (event) => {
+                const ms = Math.max(0, Number(event.target.value) || 0);
+                event.target.value = ms;
+                saveDelayField('delay_after_off_ms', ms);
+            });
+            delayBeforeOnInput.addEventListener('change', (event) => {
+                const ms = Math.max(0, Number(event.target.value) || 0);
+                event.target.value = ms;
+                saveDelayField('delay_before_on_ms', ms);
+            });
 
             wiegebonFilter.addEventListener('change', async (event) => {
                 const selectedDrukType = event.target.value;
@@ -255,6 +437,22 @@
             });
 
 
+            // Advanced settings collapsible toggle
+            const advancedToggle = document.getElementById('advanced-toggle');
+            const advancedPanel = document.getElementById('advanced-panel');
+            const advancedIcon = document.getElementById('advanced-toggle-icon');
+            advancedToggle.addEventListener('click', () => {
+                const isOpen = advancedPanel.style.display !== 'none';
+                advancedPanel.style.display = isOpen ? 'none' : 'block';
+                advancedIcon.textContent = isOpen ? '▶' : '▼';
+            });
+
+            // reset тары — sends empty Record 05 (clears tare + article data)
+            document.getElementById('reset-tare-btn').addEventListener('click', () => {
+                logEvent(null, '[reset тары] Button clicked → sending empty Record 05');
+                ipcRenderer.send('reset-empty-r05-test');
+            });
+
             // change connection
             function toggleConnection() {
                 ipcRenderer.send('connection-toggle', {
@@ -262,33 +460,63 @@
                 });
             }
             
-           // Read the initial currency configuration JSON file when the page loads
+            // Read all configs independently — a failure in one must not break the others
             window.addEventListener('DOMContentLoaded', async () => {
+                const appDirectory = path.dirname(process.execPath);
+                logEvent(null, '[CONFIG] Loading configs from: ' + appDirectory);
+
+                // --- Currency ---
                 try {
-                    // Get the directory path of the executable file
-                    const appDirectory = path.dirname(process.execPath);
-
-                    // Construct the path to the currency configuration JSON file
                     const currencyConfigPath = path.join(appDirectory, 'currency_config.json');
+                    const data = await fs.readFile(currencyConfigPath, 'utf8');
+                    const cfg = JSON.parse(data);
+                    setSelectedOption(cfg);
+                    logEvent(null, '[CONFIG] Currency loaded: ' + (cfg.currency_type || '?'));
+                } catch (e) {
+                    logEvent(null, '[CONFIG] Currency read failed: ' + (e && e.message || e));
+                }
 
-                    // Construct the path to the wiegebon configuration JSON file
+                // --- Wiegebon ---
+                try {
                     const wiegebonConfigPath = path.join(appDirectory, 'wiegebon_config.json');
-                    // Read the currency configuration JSON file
-                    const currencyConfigData = await fs.readFile(currencyConfigPath, 'utf8');
+                    const data = await fs.readFile(wiegebonConfigPath, 'utf8');
+                    const cfg = JSON.parse(data);
+                    setWiegebonSelectedOption(cfg);
+                    logEvent(null, '[CONFIG] Wiegebon loaded: ' + (cfg.druk_type || '?'));
+                } catch (e) {
+                    logEvent(null, '[CONFIG] Wiegebon read failed: ' + (e && e.message || e));
+                }
 
-                    const wiegebonConfigData = await fs.readFile(wiegebonConfigPath, 'utf8');
+                // --- FreshAI + Trigger Stable + Delays --- (file is guaranteed by main-process ensureConfigs)
+                try {
+                    const freshaiConfigPath = path.join(appDirectory, 'freshai_config.json');
+                    const data = await fs.readFile(freshaiConfigPath, 'utf8');
+                    const cfg = JSON.parse(data);
+                    setFreshaiSelectedOption(cfg);
+                    const enabled = cfg.freshai_enabled === true;
+                    const delayAfterOff = Number(cfg.delay_after_off_ms) || 0;
+                    const delayBeforeOn = Number(cfg.delay_before_on_ms) || 0;
+                    delayAfterOffInput.value = delayAfterOff;
+                    delayBeforeOnInput.value = delayBeforeOn;
+                    logEvent(null, '[CONFIG] FreshAI + Trigger Stable loaded: ' + (enabled ? 'ON' : 'OFF') +
+                        ' | delays: after_off=' + delayAfterOff + 'ms, before_on=' + delayBeforeOn + 'ms');
+                    // FreshAI=Ja also activates Trigger Stable listener
+                    if (enabled) {
+                        ipcRenderer.send('trigger-stable-toggle', { enabled: true });
+                    }
+                } catch (e) {
+                    logEvent(null, '[CONFIG ERROR] FreshAI read failed: ' + (e && e.message || e));
+                }
 
-                    let currencyConfig = JSON.parse(currencyConfigData);
-
-                    let wiegebonConfig = JSON.parse(wiegebonConfigData);
-
-                    // Set the selected option in the currency filter
-                    setSelectedOption(currencyConfig);
-                    
-                    setWiegebonSelectedOption(wiegebonConfig);
-
-                } catch (error) {
-                    console.error('Error reading currency configuration:', error);
+                // --- API URL --- (file is guaranteed by main-process ensureConfigs)
+                try {
+                    const apiConfigPath = path.join(appDirectory, 'api_config.json');
+                    const data = await fs.readFile(apiConfigPath, 'utf8');
+                    const cfg = JSON.parse(data);
+                    setApiUrlSelectedOption(cfg);
+                    logEvent(null, '[CONFIG] API URL loaded: ' + (cfg.api_url_type || 'Test'));
+                } catch (e) {
+                    logEvent(null, '[CONFIG ERROR] API URL read failed: ' + (e && e.message || e));
                 }
             });
         </script>

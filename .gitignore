@@ -4,3 +4,17 @@ release
 exes
 checksum*
 .DS_Store
+
+# Claude Code session files
+.claude/
+
+# caches / logs
+npm-cache/
+*.log
+log.txt
+
+# Confidential vendor material — DO NOT COMMIT
+# (NDA-protected SDK guide, proprietary Mettler docs, VCODisp binaries)
+*.pdf
+VCODisp-*/
+src/Scale.xlsx

@@ -66,7 +66,10 @@ export class BufferTranslator {
       return { message: 'No response from scale', error_code: 'TIMEOUT' };
     }
     const chunks = this.parse(_buf);
-    const error_code = chunks[1].toString('utf8');
+    // Guard against a short/corrupt Record 09 frame — without this a missing
+    // chunk[1] threw a TypeError that rejected getWeight() with a raw JS error
+    // instead of a structured scale error (and skipped the error-30 auto-reset).
+    const error_code = chunks[1] ? chunks[1].toString('utf8') : 'UNKNOWN';
     const message = ((): string => {
       // prettier-ignore
       switch (error_code) {

@@ -12,20 +12,33 @@ import ejs from 'ejs';
 /**
  * main function for printing receiptss
  */
-export const printReceipt = async (weight: WeightSuccessResponse) => {
+export const printReceipt = async (weight: WeightSuccessResponse, force: boolean = false) => {
 
     const path = require('path');
     // render template
-    
+
     // Get the directory path of the executable file
     const appDirectory = path.dirname(process.execPath);
 
-    const wiegebonConfigPath = path.join(appDirectory, 'wiegebon_config.json');
-    const wiegebonConfigData = await fs.readFile(wiegebonConfigPath, 'utf8');
-    const wiegebonConfig = JSON.parse(wiegebonConfigData);
+    if (force) {
+        log('[PRINT] force=true → bypassing wiegebon check (explicit print command)');
+    } else {
+        const wiegebonConfigPath = path.join(appDirectory, 'wiegebon_config.json');
+        let wiegebonConfig: any;
+        try {
+            const wiegebonConfigData = await fs.readFile(wiegebonConfigPath, 'utf8');
+            wiegebonConfig = JSON.parse(wiegebonConfigData);
+            log(`[CONFIG READ] wiegebon_config.json → druk_type=${wiegebonConfig.druk_type}`);
+        } catch (e) {
+            log(`[CONFIG READ] wiegebon_config.json FAILED → defaulting to druk_type=Ja: ${(e as any).message || e}`);
+            wiegebonConfig = { druk_type: 'Ja' };
+        }
 
-    if(wiegebonConfig.druk_type === "Nein")
-        return;
+        if(wiegebonConfig.druk_type === "Nein") {
+            log('[PRINT] skipped: wiegebon druk_type=Nein');
+            return;
+        }
+    }
 
 
     const {
@@ -33,7 +46,8 @@ export const printReceipt = async (weight: WeightSuccessResponse) => {
         should_print_additional_text,
         should_print_barcode,
         ean,
-    } = stateService.getSettingsState();
+        tare,
+    } = stateService.getSettingsState() as any;
     const [checksumOk, crc] = await verifyCRC();
     const date = new Date();
 
@@ -42,12 +56,19 @@ export const printReceipt = async (weight: WeightSuccessResponse) => {
         const currencyConfigPath = path.join(appDirectory, 'currency_config.json');
 
         // Read the currency configuration JSON file
-        const currencyConfigData = await fs.readFile(currencyConfigPath, 'utf8');
-        const currencyConfig = JSON.parse(currencyConfigData);
+        let currencyConfig: any;
+        try {
+            const currencyConfigData = await fs.readFile(currencyConfigPath, 'utf8');
+            currencyConfig = JSON.parse(currencyConfigData);
+            log(`[CONFIG READ] currency_config.json → currency_type=${currencyConfig.currency_type}`);
+        } catch (e) {
+            log(`[CONFIG READ] currency_config.json FAILED → defaulting to currency_type=Euro: ${(e as any).message || e}`);
+            currencyConfig = { currency_type: 'Euro' };
+        }
 
-        let templatePath;
+        let templatePath: string;
 
-        let dateStr;
+        let dateStr: string = '';
 
         // Determine the template path based on the currency type
         switch (currencyConfig.currency_type) {
@@ -93,10 +114,69 @@ export const printReceipt = async (weight: WeightSuccessResponse) => {
                 addZ(date.getMinutes()) +
                 ' Uhr';
                 break;
+            case 'BulgrarianLev':
+                templatePath = join(app.getAppPath(), 'dist/templates/receiptBulgarianLev.ejs');
+                dateStr =
+                addZ(date.getDate()) +
+                '.' +
+                addZ(date.getMonth() + 1) +
+                '.' +
+                date.getFullYear() +
+                '; ' +
+                date.getHours() +
+                '.' +
+                addZ(date.getMinutes()) +
+                ' ч.';
+                break;
+            case 'PolishZloty':
+                templatePath = join(app.getAppPath(), 'dist/templates/receiptPolishZloty.ejs');
+                dateStr =
+                addZ(date.getDate()) +
+                '.' +
+                addZ(date.getMonth() + 1) +
+                '.' +
+                date.getFullYear() +
+                '; ' +
+                date.getHours() +
+                '.' +
+                addZ(date.getMinutes()) +
+                '';
+                break;
+            case 'SerbianDinar':
+                    templatePath = join(app.getAppPath(), 'dist/templates/receiptSerbianDinar.ejs');
+                    dateStr =
+                    addZ(date.getDate()) +
+                    '.' +
+                    addZ(date.getMonth() + 1) +
+                    '.' +
+                    date.getFullYear() +
+                    '; ' +
+                    date.getHours() +
+                    '.' +
+                    addZ(date.getMinutes()) +
+                    ' часова';
+                    break;
+            case 'SwissFranc':
+                templatePath = join(app.getAppPath(), 'dist/templates/receiptSwissFranc.ejs');
+                dateStr =
+                addZ(date.getDate()) +
+                '.' +
+                addZ(date.getMonth() + 1) +
+                '.' +
+                date.getFullYear() +
+                '; ' +
+                date.getHours() +
+                '.' +
+                addZ(date.getMinutes()) +
+                ' Uhr';
+                break;
             default:
                 templatePath = join(app.getAppPath(), 'dist/templates/receiptFranc.ejs');
                 break;
         }
+
+    // Normalize tare to a numeric value — stateService may have it as string ("0.004") or number
+    const tareNum = typeof tare === 'number' ? tare : (typeof tare === 'string' ? parseFloat(tare.replace(',', '.')) : 0);
 
     const context: ReceiptContext = {
         ...weight,
@@ -105,6 +185,8 @@ export const printReceipt = async (weight: WeightSuccessResponse) => {
         should_print_additional_text,
         date: dateStr,
         crc: crc.toUpperCase(),
+        tare: Number.isFinite(tareNum) ? tareNum : 0,
+        ean,
     };
 
     if (should_print_barcode) {
@@ -121,24 +203,78 @@ export const printReceipt = async (weight: WeightSuccessResponse) => {
         context.barcode = barcode;
     }
 
-        // Render the template
-        ejs.renderFile(templatePath, context, (err, data) => {
-            if (err) return log(err);
-            // create browser window
-            const workerWindow: BrowserWindow | undefined = new BrowserWindow({
-                show: false,
-            });
-            workerWindow.loadURL(
-                'data:text/html;charset=utf-8,' + encodeURI(data)
-            );
-            // determine if there are any printers available (assuming no printers = dev env)
-            const action =
-                workerWindow.webContents.getPrinters().length > 0
-                    ? sendToPrinter
-                    : saveAsPDF;
-            // start printing
-            workerWindow.webContents.on('did-finish-load', () => {
-                action(workerWindow);
+        // Render the template as a real Promise so we can await actual print completion
+        log(`[PRINT] using template: ${templatePath}`);
+        await new Promise<void>((resolve) => {
+            ejs.renderFile(templatePath, context, (err, data) => {
+                if (err) {
+                    log('[PRINT] ejs.renderFile error:', err);
+                    return resolve();
+                }
+                log(`[PRINT] EJS rendered OK, length=${data.length} chars`);
+
+                const workerWindow: BrowserWindow = new BrowserWindow({
+                    show: false,
+                });
+                workerWindow.loadURL(
+                    'data:text/html;charset=utf-8,' + encodeURI(data)
+                );
+
+                let resolved = false;
+                const finish = () => {
+                    if (resolved) return;
+                    resolved = true;
+                    clearTimeout(safetyTimer);
+                    try { workerWindow.close(); } catch (e) {}
+                    resolve();
+                };
+
+                workerWindow.webContents.on('did-finish-load', () => {
+                    log('[PRINT] did-finish-load fired');
+
+                    // IMPORTANT: enumerate printers HERE, after the page finished
+                    // loading. On the very first launch after install, calling
+                    // getPrinters() too early (right after createWindow) returns an
+                    // EMPTY list because Chromium's print subsystem is not warmed up
+                    // yet — which made the code fall back to PDF and skip printing.
+                    // Querying inside did-finish-load gives the real printer list.
+                    const printers = workerWindow.webContents.getPrinters();
+                    log(`[PRINT] available printers: ${printers.length}`);
+                    printers.forEach((p, i) => {
+                        log(`[PRINT]   [${i}] name="${p.name}" isDefault=${p.isDefault} status=${p.status}`);
+                    });
+
+                    if (printers.length > 0) {
+                        // Explicitly select a printer: the OS default if flagged,
+                        // otherwise the first one. Relying on Chromium's implicit
+                        // default silently failed on machines where no printer was
+                        // flagged isDefault.
+                        const target = printers.find((p) => p.isDefault) || printers[0];
+                        log(`[PRINT] sending to printer "${target.name}"`);
+                        const printOpts: any = { silent: true, deviceName: target.name, margins: { marginType: 'none' } };
+                        workerWindow.webContents.print(
+                            printOpts,
+                            (success: boolean, errMsg: string) => {
+                                if (success) log('[PRINT] printed successfully');
+                                if (errMsg) log('[PRINT] err while printing:', errMsg);
+                                finish();
+                            }
+                        );
+                    } else {
+                        // No printers at all. Do NOT open a modal save dialog here —
+                        // on an unattended POS it would hang the request forever and
+                        // race the safety timer. Just log and resolve.
+                        log('[PRINT] no printers found — skipping print (no modal dialog on POS)');
+                        finish();
+                    }
+                });
+
+                // Safety timeout — don't block forever if did-finish-load never fires
+                const safetyTimer = setTimeout(() => {
+                    if (resolved) return;
+                    log('[PRINT] safety timeout 10s — resolving');
+                    finish();
+                }, 10000);
             });
         });
 };
