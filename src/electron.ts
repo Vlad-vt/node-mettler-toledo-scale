@@ -12,6 +12,57 @@ const { version } = require('../package.json');
 
 export let mainWindow: BrowserWindow | null;
 
+// [DIAG] Global crash handlers — catch silent failures so they end up in the log
+process.on('uncaughtException', (err) => {
+    try { log(`[CRASH] uncaughtException: ${err && err.stack ? err.stack : err}`); } catch (_) {}
+});
+process.on('unhandledRejection', (reason: any) => {
+    try { log(`[CRASH] unhandledRejection: ${reason && reason.stack ? reason.stack : JSON.stringify(reason)}`); } catch (_) {}
+});
+
+// [DIAG] Heartbeat every 60 seconds — proves the process is alive and the event
+// loop is not frozen even when no traffic is happening.
+setInterval(() => {
+    try {
+        const mem = process.memoryUsage();
+        log(`[HEARTBEAT] alive, uptime=${Math.round(process.uptime())}s rss=${Math.round(mem.rss / 1024 / 1024)}MB heap=${Math.round(mem.heapUsed / 1024 / 1024)}MB sockets=${openSockets}`);
+    } catch (_) {}
+}, 60000);
+
+// [DIAG] Live count of open TCP sockets on our HTTP/HTTPS servers.
+let openSockets = 0;
+
+/**
+ * [DIAG] Attach connection-level observability to an HTTP/HTTPS server.
+ * Pure observation: we only ADD listeners for 'connection' and per-socket
+ * events. We deliberately do NOT listen for 'clientError' or 'timeout' on the
+ * server, because attaching those would OVERRIDE Node's default handling and
+ * change behaviour — this build must behave exactly like the 2024-05-17 one.
+ */
+function instrumentServer(server: any, label: string) {
+    server.on('connection', (socket: any) => {
+        openSockets++;
+        const id = `${socket.remoteAddress}:${socket.remotePort}`;
+        const openedAt = Date.now();
+        log(`[CONN] ${label} OPEN ${id} (open sockets=${openSockets})`);
+
+        socket.on('close', (hadError: boolean) => {
+            openSockets--;
+            log(`[CONN] ${label} CLOSE ${id} hadError=${hadError} lifetime=${Date.now() - openedAt}ms (open sockets=${openSockets})`);
+        });
+        socket.on('error', (err: any) => {
+            log(`[CONN] ${label} ERROR ${id}: ${err && err.message ? err.message : err}`);
+        });
+        socket.on('timeout', () => {
+            log(`[CONN] ${label} TIMEOUT ${id} after ${Date.now() - openedAt}ms`);
+        });
+    });
+
+    // Log the effective Node timeout settings once, so the log states exactly
+    // which defaults this build ran with.
+    log(`[CONN] ${label} timeouts: keepAliveTimeout=${server.keepAliveTimeout}ms headersTimeout=${server.headersTimeout}ms timeout=${server.timeout}ms`);
+}
+
 function createApplicationWindow() {
     mainWindow = new BrowserWindow({
         width: 400,
@@ -71,6 +122,10 @@ function createApplicationWindow() {
                     log('API listening on', PORT);
                     log('version', version);
                 });
+
+            instrumentServer(httpsServer, 'HTTPS:' + PORT_HTTPS);
+            instrumentServer(httpServer, 'HTTP:' + PORT);
+            log(`[DIAG] node=${process.versions.node} electron=${process.versions.electron} chrome=${process.versions.chrome}`);
 
             scaleCommunicationService.init();
             //HERE DO NOT HIDE WINDOWS

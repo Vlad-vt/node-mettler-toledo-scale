@@ -4,3 +4,7 @@ release
 exes
 checksum*
 .DS_Store
+# caches / logs
+npm-cache/
+*.log
+log.txt

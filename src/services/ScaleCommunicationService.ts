@@ -25,8 +25,10 @@ class ScaleCommunicationService {
   init(): Promise<ConnectResponse> {
     // TODO: handle when only 1 pipe connects
     if (this.isConnected) {
+      log('[INIT] already connected — skipping');
       return Promise.resolve({ input: true, output: true });
     }
+    log(`[INIT] connecting pipes in="${IN_PIPE_PATH}" out="${OUT_PIPE_PATH}"`);
     this.input_pipe = new Pipe(IN_PIPE_PATH);
     this.input_pipe.connect();
     if (IN_PIPE_PATH !== OUT_PIPE_PATH) {
@@ -45,6 +47,7 @@ class ScaleCommunicationService {
         tap(({ input, output }) => {
           const hasErrors = input instanceof Error || output instanceof Error;
           const areTruthy = input && output;
+          log(`[INIT] pipes settled: connected=${Boolean(areTruthy && !hasErrors)} hasErrors=${hasErrors}`);
           mainWindow?.webContents.send('connection-changed', { isConnected: areTruthy && !hasErrors });
           if (hasErrors) {
             log('errors while connecting to pipes', input, output);
@@ -59,6 +62,7 @@ class ScaleCommunicationService {
    * highest level disconnect func
    */
   destroy() {
+    log('[DESTROY] disconnecting pipes');
     if (this.isConnected) {
       this.input_pipe.disconnect();
       this.output_pipe.disconnect();
@@ -84,21 +88,34 @@ class ScaleCommunicationService {
    */
   private performRawRequest(buffer: Buffer): Promise<Buffer> {
     return new Promise((resolve) => {
+      // [DIAG] instrumentation only — the logic below is unchanged from the
+      // original 2024-05-17 build (rxjs timeout(1000) + catchError -> NAK).
+      const reqHex = buffer.toString('hex');
+      const reqAscii = Array.from(buffer).map(b => (b >= 0x20 && b < 0x7f) ? String.fromCharCode(b) : '.').join('');
+      const startedAt = Date.now();
+
       const dataSub = this.output_pipe.data$
         .pipe(
           timeout(1000),
           catchError((_) => {
-            log('request timeout');
+            log(`[SCALE] !!! TIMEOUT after 1000ms (req hex=${reqHex})`);
             return of(Buffer.from([_b.NAK]));
           }),
         )
         .subscribe((response) => {
-          log('SCALE RESPONSE =>', response);
+          const resHex = response.toString('hex');
+          const resAscii = Array.from(response).map(b => (b >= 0x20 && b < 0x7f) ? String.fromCharCode(b) : '.').join('');
+          log(`[SCALE] <<< RES hex=${resHex} ascii="${resAscii}" len=${response.length} elapsed=${Date.now() - startedAt}ms`);
           dataSub.unsubscribe();
           resolve(response);
         });
-      log('SCALE REQ =>', buffer);
-      this.input_pipe.socket.write(buffer);
+      log(`[SCALE] >>> REQ hex=${reqHex} ascii="${reqAscii}" len=${buffer.length}`);
+      try {
+        const writeOk = this.input_pipe.socket.write(buffer);
+        log(`[SCALE]     socket.write returned: ${writeOk}`);
+      } catch (e) {
+        log(`[SCALE] !!! socket.write threw: ${(e as any).message || e}`);
+      }
     });
   }
 
@@ -156,15 +173,23 @@ class ScaleCommunicationService {
    * returns valid, human-readable response
    */
   async getWeight(): Promise<WeightSuccessResponseWithReceiptInfo> {
+    log('[getWeight] sending EOT ENQ to scale');
     const weight = await this.requestCurrentWeight();
+    log(`[getWeight] raw response: ${weight.toString('hex')}`);
     if (BufferTranslator.isNak(weight)) {
+      log('[getWeight] NAK received — asking scale for reason');
       const why = await this.requestNakExplanation();
-      throw BufferTranslator.parseNakReason(why);
+      const reason = BufferTranslator.parseNakReason(why);
+      log(`[getWeight] NAK reason: ${JSON.stringify(reason)} (raw=${why.toString('hex')})`);
+      throw reason;
     } else {
       const parsedWeight = BufferTranslator.parseValidWeight(weight);
+      log(`[getWeight] OK parsed: ${JSON.stringify(parsedWeight)}`);
       let errors;
       try {
+        log('[getWeight] calling printReceipt...');
         await printReceipt(parsedWeight);
+        log('[getWeight] printReceipt returned');
       } catch (error) {
         log('printing failed:', error);
         errors = error;
@@ -185,12 +210,17 @@ class ScaleCommunicationService {
       should_print_additional_text: settings.should_print_additional_text as boolean,
       ean: settings.ean as string,
     };
+    log(`[setSettings] sending Record 05: ${JSON.stringify(scaleSettings)}`);
     const scaleResp = await this.requestScale(BufferTranslator.createSettingsRequest(scaleSettings));
     if (BufferTranslator.isNak(scaleResp)) {
+      log('[setSettings] NAK received — asking scale for reason');
       const why = await this.requestNakExplanation();
-      throw BufferTranslator.parseNakReason(why);
+      const reason = BufferTranslator.parseNakReason(why);
+      log(`[setSettings] NAK reason: ${JSON.stringify(reason)} (raw=${why.toString('hex')})`);
+      throw reason;
     }
     if (BufferTranslator.isAck(scaleResp)) {
+      log('[setSettings] ACK — settings stored');
       stateService.setSettingState(scaleSettings);
       return true;
     } else {

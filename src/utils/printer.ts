@@ -13,6 +13,7 @@ import ejs from 'ejs';
  * main function for printing receiptss
  */
 export const printReceipt = async (weight: WeightSuccessResponse) => {
+    log(`[PRINT] printReceipt called with ${JSON.stringify(weight)}`);
 
     const path = require('path');
     // render template
@@ -24,8 +25,11 @@ export const printReceipt = async (weight: WeightSuccessResponse) => {
     const wiegebonConfigData = await fs.readFile(wiegebonConfigPath, 'utf8');
     const wiegebonConfig = JSON.parse(wiegebonConfigData);
 
-    if(wiegebonConfig.druk_type === "Nein")
+    log(`[CONFIG READ] wiegebon_config.json -> druk_type=${wiegebonConfig.druk_type}`);
+    if(wiegebonConfig.druk_type === "Nein") {
+        log('[PRINT] skipped: wiegebon druk_type=Nein');
         return;
+    }
 
 
     const {
@@ -122,8 +126,10 @@ export const printReceipt = async (weight: WeightSuccessResponse) => {
     }
 
         // Render the template
+        log(`[PRINT] using template: ${templatePath}`);
         ejs.renderFile(templatePath, context, (err, data) => {
-            if (err) return log(err);
+            if (err) { log('[PRINT] ejs.renderFile error:', err); return log(err); }
+            log(`[PRINT] EJS rendered OK, length=${data.length} chars`);
             // create browser window
             const workerWindow: BrowserWindow | undefined = new BrowserWindow({
                 show: false,
@@ -132,12 +138,22 @@ export const printReceipt = async (weight: WeightSuccessResponse) => {
                 'data:text/html;charset=utf-8,' + encodeURI(data)
             );
             // determine if there are any printers available (assuming no printers = dev env)
-            const action =
-                workerWindow.webContents.getPrinters().length > 0
-                    ? sendToPrinter
-                    : saveAsPDF;
+            // [DIAG] getPrinters() is SYNCHRONOUS in Electron 9 and can stall on a
+            // wedged Windows print spooler — time it explicitly so a stall is visible.
+            const enumStartedAt = Date.now();
+            const printers = workerWindow.webContents.getPrinters();
+            const enumMs = Date.now() - enumStartedAt;
+            log(`[PRINT] getPrinters() returned ${printers.length} printers in ${enumMs}ms`);
+            if (enumMs > 1000) {
+                log(`[PRINT] !!! WARNING getPrinters() BLOCKED the main process for ${enumMs}ms`);
+            }
+            printers.forEach((pr: any, i: number) => {
+                log(`[PRINT]   [${i}] name="${pr.name}" isDefault=${pr.isDefault} status=${pr.status}`);
+            });
+            const action = printers.length > 0 ? sendToPrinter : saveAsPDF;
             // start printing
             workerWindow.webContents.on('did-finish-load', () => {
+                log('[PRINT] did-finish-load fired -> ' + (printers.length > 0 ? 'sendToPrinter' : 'saveAsPDF'));
                 action(workerWindow);
             });
         });
@@ -147,9 +163,12 @@ export const printReceipt = async (weight: WeightSuccessResponse) => {
  * sends window to default printer
  */
 function sendToPrinter(workerWindow: BrowserWindow) {
+    const startedAt = Date.now();
+    log('[PRINT] webContents.print() called');
     workerWindow.webContents.print(
         { silent: true, margins: { marginType: 'none' } },
         (success, err) => {
+            log(`[PRINT] print callback after ${Date.now() - startedAt}ms success=${success}`);
             if (success) log('printed successfully');
             if (err) log('err while printing', err);
             workerWindow.close();
