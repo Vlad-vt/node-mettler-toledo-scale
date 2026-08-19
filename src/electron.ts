@@ -9,6 +9,7 @@ import path from 'path';
 import { scaleCommunicationService } from './services/ScaleCommunicationService';
 import { verifyCRC } from './utils/CRCVerification';
 import { log } from './utils/logger';
+import { syncTriggerStableFromVcodisp, restartVcodisp } from './utils/vcodispSync';
 const { version } = require('../package.json');
 
 export let mainWindow: BrowserWindow | null;
@@ -42,6 +43,9 @@ function ensureConfigs() {
         'wiegebon_config.json': { druk_type: 'Ja' },
         'freshai_config.json': { freshai_enabled: true, delay_after_off_ms: 250, delay_before_on_ms: 0 },
         'api_config.json': { api_url_type: 'Test' },
+        // printer_name empty = use the OS default printer. Set it to the exact
+        // Windows printer name (e.g. "SII RP-F10/G10") to pin the receipt printer.
+        'printer_config.json': { printer_name: '' },
     };
 
     for (const [name, def] of Object.entries(defaults)) {
@@ -213,6 +217,35 @@ function createLoadingScreen() {
 
 app.whenReady().then((_) => {
     ensureConfigs();
+
+    // Sync our FreshAI setting FROM VCODisp's trigger_stable (source of truth).
+    // Runs BEFORE the window loads so the UI reads the already-synced value.
+    // If a missing line was just added, VCODisp is restarted so it re-reads the
+    // config and creates the trigger pipe, then we re-arm our trigger listener.
+    try {
+        const appDirectory = path.dirname(process.execPath);
+        const sync = syncTriggerStableFromVcodisp(appDirectory);
+        if (sync.added) {
+            restartVcodisp()
+                .then(() => {
+                    // Give VCODisp time to come up and create the trigger pipe,
+                    // then (re)connect the listener — the trigger pipe has no
+                    // auto-retry, so an early attempt during restart would fail.
+                    setTimeout(() => {
+                        try {
+                            log('[VCODISP] Re-arming trigger listener after VCODisp restart');
+                            scaleCommunicationService.setTriggerStableEnabled(true);
+                        } catch (e) {
+                            log(`[VCODISP] Re-arm failed: ${(e as any).message || e}`);
+                        }
+                    }, 8000);
+                })
+                .catch((e) => log(`[VCODISP] restart flow error: ${(e as any).message || e}`));
+        }
+    } catch (e) {
+        log(`[VCODISP] trigger_stable sync failed: ${(e as any).message || e}`);
+    }
+
     const hasSquirrelEvents = process.argv.some((arg) =>
         arg.includes('--squirrel')
     );

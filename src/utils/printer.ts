@@ -10,6 +10,28 @@ import bwipjs from 'bwip-js';
 import ejs from 'ejs';
 
 /**
+ * Read the REAL Windows default printer from the registry.
+ * Electron 9's getPrinters() isDefault flag is cached and can disagree with the
+ * actual Windows "Standard" printer (we saw it report AURES while Windows showed
+ * SII RP-F10/G10 as default). The registry value is the live truth:
+ *   HKCU\Software\Microsoft\Windows NT\CurrentVersion\Windows -> Device
+ *   = "SII RP-F10/G10 (Kopie 2),winspool,Ne00:"  (name is before the first comma)
+ */
+function getWindowsDefaultPrinter(): string {
+    try {
+        const out = require('child_process').execSync(
+            'reg query "HKCU\\Software\\Microsoft\\Windows NT\\CurrentVersion\\Windows" /v Device',
+            { encoding: 'utf8', timeout: 3000, windowsHide: true }
+        ) as string;
+        const m = out.match(/Device\s+REG_SZ\s+(.+)/);
+        if (m && m[1]) return m[1].split(',')[0].trim();
+    } catch (e) {
+        log('[PRINT] could not read Windows default printer from registry: ' + ((e as any).message || e));
+    }
+    return '';
+}
+
+/**
  * main function for printing receiptss
  */
 export const printReceipt = async (weight: WeightSuccessResponse, force: boolean = false) => {
@@ -19,6 +41,29 @@ export const printReceipt = async (weight: WeightSuccessResponse, force: boolean
 
     // Get the directory path of the executable file
     const appDirectory = path.dirname(process.execPath);
+
+    // Capture the article settings SYNCHRONOUSLY, before any await. printReceipt
+    // is fired in the background from getWeight, so the next request's setSettings
+    // could otherwise overwrite stateService before we read it here.
+    const {
+        description_text,
+        should_print_additional_text,
+        should_print_barcode,
+        ean,
+        tare,
+    } = stateService.getSettingsState() as any;
+
+    // Configured receipt printer (printer_config.json). Empty = OS default.
+    let configuredPrinter = '';
+    try {
+        const cfgRaw = require('fs').readFileSync(path.join(appDirectory, 'printer_config.json'), 'utf8');
+        configuredPrinter = (JSON.parse(cfgRaw).printer_name || '').trim();
+    } catch (e) { /* no config → OS default */ }
+
+    // The REAL Windows default (from the registry) — trusted over Electron's
+    // possibly-stale isDefault flag.
+    const winDefaultPrinter = getWindowsDefaultPrinter();
+    log(`[PRINT] Windows default printer (registry) = "${winDefaultPrinter}"; configured = "${configuredPrinter}"`);
 
     if (force) {
         log('[PRINT] force=true → bypassing wiegebon check (explicit print command)');
@@ -41,13 +86,6 @@ export const printReceipt = async (weight: WeightSuccessResponse, force: boolean
     }
 
 
-    const {
-        description_text,
-        should_print_additional_text,
-        should_print_barcode,
-        ean,
-        tare,
-    } = stateService.getSettingsState() as any;
     const [checksumOk, crc] = await verifyCRC();
     const date = new Date();
 
@@ -245,12 +283,23 @@ export const printReceipt = async (weight: WeightSuccessResponse, force: boolean
                     });
 
                     if (printers.length > 0) {
-                        // Explicitly select a printer: the OS default if flagged,
-                        // otherwise the first one. Relying on Chromium's implicit
-                        // default silently failed on machines where no printer was
-                        // flagged isDefault.
-                        const target = printers.find((p) => p.isDefault) || printers[0];
-                        log(`[PRINT] sending to printer "${target.name}"`);
+                        // Printer selection priority:
+                        //   1. configured printer_name (printer_config.json) — exact match
+                        //   2. REAL Windows default from the registry (trusted)
+                        //   3. Electron's isDefault flag (may be stale)
+                        //   4. first available
+                        let target = configuredPrinter ? printers.find((p) => p.name === configuredPrinter) : undefined;
+                        let how = target ? 'configured' : '';
+                        if (configuredPrinter && !target) {
+                            log(`[PRINT] configured printer "${configuredPrinter}" not found — trying Windows default`);
+                        }
+                        if (!target && winDefaultPrinter) {
+                            target = printers.find((p) => p.name === winDefaultPrinter);
+                            if (target) how = 'windows-default';
+                        }
+                        if (!target) { target = printers.find((p) => p.isDefault); if (target) how = 'electron-isDefault'; }
+                        if (!target) { target = printers[0]; how = 'first-available'; }
+                        log(`[PRINT] sending to printer "${target.name}" (via ${how})`);
                         const printOpts: any = { silent: true, deviceName: target.name, margins: { marginType: 'none' } };
                         workerWindow.webContents.print(
                             printOpts,

@@ -1,5 +1,5 @@
-import { forkJoin, merge, of, Subscription } from 'rxjs';
-import { catchError, first, tap, timeout } from 'rxjs/operators';
+import { forkJoin, merge, Subscription } from 'rxjs';
+import { first, tap } from 'rxjs/operators';
 import { BufferTranslator } from '../classes/BufferTranslator';
 import { Pipe } from '../classes/Pipe';
 import { ScaleTranslator } from '../classes/ScaleTranslator';
@@ -23,6 +23,10 @@ class ScaleCommunicationService {
   output_pipe!: Pipe;
 
   private isRequestPending = false;
+  // Single persistent drain of output_pipe.data$. When a request is waiting,
+  // its resolver is here; otherwise data is discarded (see setupOutputDrain).
+  private pendingResponse: ((buf: Buffer) => void) | null = null;
+  private outputDrainSub: Subscription | null = null;
   private latestTriggerResult: WeightSuccessResponseWithReceiptInfo | null = null;
   private triggerStableSub: Subscription | null = null;
   private triggerStablePipe: Pipe | null = null;
@@ -95,6 +99,7 @@ class ScaleCommunicationService {
             log('errors while connecting to pipes', input, output);
           }
           if (connected) {
+            this.setupOutputDrain();      // one persistent data listener (fixes desync)
             this.watchMainPipesForDrop();
           }
         }),
@@ -107,10 +112,13 @@ class ScaleCommunicationService {
       });
   }
 
-  /** Remove connection-drop watchers and destroy the current main pipes. */
+  /** Remove connection-drop watchers, the data drain, and destroy the pipes. */
   private teardownMainPipes() {
     if (this.inputConnSub) { this.inputConnSub.unsubscribe(); this.inputConnSub = null; }
     if (this.outputConnSub) { this.outputConnSub.unsubscribe(); this.outputConnSub = null; }
+    if (this.outputDrainSub) { this.outputDrainSub.unsubscribe(); this.outputDrainSub = null; }
+    // Fail any in-flight request instead of leaving it hung on a dead pipe.
+    if (this.pendingResponse) { const r = this.pendingResponse; this.pendingResponse = null; try { r(Buffer.from([_b.NAK])); } catch (e) {} }
     try { if (this.input_pipe) this.input_pipe.disconnect(); } catch (e) {}
     try { if (this.output_pipe && this.output_pipe !== this.input_pipe) this.output_pipe.disconnect(); } catch (e) {}
   }
@@ -225,45 +233,85 @@ class ScaleCommunicationService {
   }
 
   /**
-   * send a request to scale and awaits for the response.
-   * All requests are serialized through requestQueue so two concurrent
-   * subscriptions on output_pipe.data$ can never tangle their responses.
+   * Attach ONE persistent listener to output_pipe.data$ (a net.Socket 'data'
+   * event). This is the fix for the request/response desync: previously each
+   * performRawRequest subscribed & unsubscribed per request, so between requests
+   * the socket had NO listener and buffered any late/unsolicited frame; the next
+   * request then received the PREVIOUS request's stale response (off-by-one), and
+   * timeouts cascaded into multi-second delays. With a permanent drain the socket
+   * never buffers: a frame is delivered to the waiting request, or discarded when
+   * idle so it can't corrupt the next one.
+   */
+  private setupOutputDrain() {
+    if (this.outputDrainSub) { this.outputDrainSub.unsubscribe(); this.outputDrainSub = null; }
+    if (!this.output_pipe || !this.output_pipe.data$) return;
+    this.pendingResponse = null;
+    this.outputDrainSub = this.output_pipe.data$.subscribe((data: Buffer) => {
+      const resolver = this.pendingResponse;
+      if (resolver) {
+        this.pendingResponse = null;
+        resolver(data);
+      } else {
+        // No request is waiting — this is a late/stale/unsolicited frame.
+        // Discard it so it is NOT mis-delivered to the next request.
+        log(`[SCALE] (idle) discarding unsolicited/late data hex=${data.toString('hex')} len=${data.length}`);
+      }
+    });
+  }
+
+  /**
+   * send a request to scale and await its response. Requests are serialized
+   * through requestQueue, and responses are correlated via the single output
+   * drain (setupOutputDrain), so no two requests can tangle or desync.
    */
   private performRawRequest(buffer: Buffer): Promise<Buffer> {
     const run = () => new Promise<Buffer>((resolve) => {
       const reqHex = buffer.toString('hex');
       const reqAscii = Array.from(buffer).map(b => (b >= 0x20 && b < 0x7f) ? String.fromCharCode(b) : '.').join('');
-      log(`[SCALE] >>> REQ hex=${reqHex} ascii="${reqAscii}" len=${buffer.length} pending=${this.isRequestPending}`);
+      log(`[SCALE] >>> REQ hex=${reqHex} ascii="${reqAscii}" len=${buffer.length}`);
 
       const startedAt = Date.now();
       this.isRequestPending = true;
-      const dataSub = this.output_pipe.data$
-        .pipe(
-          timeout(1000),
-          catchError((_) => {
-            log(`[SCALE] !!! TIMEOUT after 1000ms (req hex=${reqHex})`);
-            return of(Buffer.from([_b.NAK]));
-          }),
-        )
-        .subscribe((response) => {
-          const elapsed = Date.now() - startedAt;
-          const resHex = response.toString('hex');
-          const resAscii = Array.from(response).map(b => (b >= 0x20 && b < 0x7f) ? String.fromCharCode(b) : '.').join('');
-          log(`[SCALE] <<< RES hex=${resHex} ascii="${resAscii}" len=${response.length} elapsed=${elapsed}ms`);
-          dataSub.unsubscribe();
-          this.isRequestPending = false;
-          resolve(response);
-        });
+      let settled = false;
+
+      const timer = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        this.pendingResponse = null;   // stop waiting; a late reply will be discarded by the drain
+        this.isRequestPending = false;
+        log(`[SCALE] !!! TIMEOUT after 1000ms (req hex=${reqHex})`);
+        resolve(Buffer.from([_b.NAK]));
+      }, 1000);
+
+      this.pendingResponse = (response: Buffer) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        this.isRequestPending = false;
+        const elapsed = Date.now() - startedAt;
+        const resHex = response.toString('hex');
+        const resAscii = Array.from(response).map(b => (b >= 0x20 && b < 0x7f) ? String.fromCharCode(b) : '.').join('');
+        log(`[SCALE] <<< RES hex=${resHex} ascii="${resAscii}" len=${response.length} elapsed=${elapsed}ms`);
+        resolve(response);
+      };
 
       try {
         const writeOk = this.input_pipe.socket.write(buffer);
         log(`[SCALE]     socket.write returned: ${writeOk}`);
       } catch (e) {
-        log(`[SCALE] !!! socket.write threw: ${(e as any).message || e}`);
+        // Write failed — settle now so we don't hang the queue for 1s.
+        if (!settled) {
+          settled = true;
+          clearTimeout(timer);
+          this.pendingResponse = null;
+          this.isRequestPending = false;
+          log(`[SCALE] !!! socket.write threw: ${(e as any).message || e}`);
+          resolve(Buffer.from([_b.NAK]));
+        }
       }
     });
 
-    // Chain after any in-flight request so we never have two subscriptions live at once
+    // Chain after any in-flight request so only one request is active at a time.
     const queued = this.requestQueue.then(run, run);
     this.requestQueue = queued.catch(() => {});  // swallow errors in chain so it doesn't lock up
     return queued;
@@ -450,17 +498,22 @@ class ScaleCommunicationService {
     if (!weight) {
       log(`[getWeight] All ${MAX_RETRIES} attempts failed, NAK: ${JSON.stringify(lastNakReason)}`);
 
-      // On error 30 ("scale in MIN range" — operator started a weighing with no
-      // item on the scale) auto-apply the tare reset (empty Record 05). This
-      // clears the pending article data so trigger_stable (Record 70) can fire
-      // again for the next item — without this the AI stays silent until reset.
-      if (lastNakReason && lastNakReason.error_code === '30') {
-        log('[getWeight] Error 30 detected → auto-applying tare reset (empty Record 05)');
+      // Auto-apply the tare reset (empty Record 05) after retries are exhausted on:
+      //   error 30 — "scale in MIN range" (weighing started with no item),
+      //   error 20 — "scale still in motion" (item disturbed/jiggled, never settled),
+      //   error 32 — "scale in overload range" (too much weight / stuck overload).
+      // In all these the scale gets stuck and the next weighing / trigger_stable
+      // stays broken until a reset. The empty Record 05 clears the pending article
+      // data and re-arms trigger_stable. Only done AFTER all retries fail, so a
+      // transient condition that clears on its own is handled by the retries first.
+      const code = lastNakReason && lastNakReason.error_code;
+      if (code === '30' || code === '20' || code === '32') {
+        log(`[getWeight] Error ${code} after all retries → auto-applying tare reset (empty Record 05)`);
         try {
           await this.sendEmptyRecord05();
-          log('[getWeight] Tare reset (empty Record 05) applied after error 30');
+          log(`[getWeight] Tare reset (empty Record 05) applied after error ${code}`);
         } catch (e) {
-          log(`[getWeight] Tare reset after error 30 failed: ${JSON.stringify(e) || (e as any).message || e}`);
+          log(`[getWeight] Tare reset after error ${code} failed: ${JSON.stringify(e) || (e as any).message || e}`);
         }
       }
 
@@ -470,19 +523,14 @@ class ScaleCommunicationService {
     {
       const parsedWeight = BufferTranslator.parseValidWeight(weight);
 
-      // NOTE: getWeight is the DEFAULT flow — POS calls it AFTER the AI
-      // recognition already happened in the trigger_stable handler (Record 70).
-      // So we do NOT run FreshAI again here. This is the classic behaviour:
-      // get weight from scale → print receipt. The VCODisp window appears
-      // naturally via the Record 05 that POS sent in the preceding setSettings.
-      let errors;
-      try {
-        await printReceipt(parsedWeight);
-      } catch (error) {
-        log('printing failed:', error);
-        errors = error;
-      }
-      return { ...parsedWeight, receipt_printed: !Boolean(errors), receipt_print_errors: errors, recognition: null };
+      // Print the receipt in the BACKGROUND — do NOT block the weight response.
+      // The POS only needs the weight to add the item to the cart; making it wait
+      // ~1s for the print (BrowserWindow creation + spooling) is what caused the
+      // "add to cart" delay. We fire-and-forget the print and return immediately.
+      printReceipt(parsedWeight).catch((error) => {
+        log('printing failed (background):', error);
+      });
+      return { ...parsedWeight, receipt_printed: true, receipt_print_errors: null, recognition: null };
     }
   }
 
